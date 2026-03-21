@@ -7,6 +7,7 @@ library(plotly)
 library(DT)
 library(tidyr)
 library(scales)
+library(jsonlite)
 
 ui <- fluidPage(
   titlePanel("DataPilot: EDA & Preprocessing App"),
@@ -14,10 +15,16 @@ ui <- fluidPage(
   sidebarLayout(
     sidebarPanel(
       h4("1. Upload Data"),
-      fileInput("file", "Upload CSV or Excel", 
-                accept = c(".csv", ".xlsx")),
-      selectInput("builtin", "Or use built-in dataset",
-                  choices = c("None", "iris", "mtcars")),
+      fileInput(
+        "file",
+        "Upload CSV, Excel, JSON, or RDS",
+        accept = c(".csv", ".xlsx", ".json", ".rds")
+      ),
+      selectInput(
+        "builtin",
+        "Or use built-in dataset",
+        choices = c("None", "iris", "mtcars")
+      ),
       
       hr(),
       
@@ -28,8 +35,7 @@ ui <- fluidPage(
       hr(),
       
       h4("3. Feature Engineering"),
-      selectInput("num_var", "Select numeric variable",
-                  choices = NULL),
+      selectInput("num_var", "Select numeric variable", choices = NULL),
       checkboxInput("log_transform", "Log transform"),
       textInput("new_var", "New variable name", "new_var"),
       
@@ -59,26 +65,53 @@ ui <- fluidPage(
 
 server <- function(input, output, session) {
   
+  # -------- Helper: safely convert object to data frame --------
+  to_dataframe <- function(obj) {
+    if (is.data.frame(obj)) {
+      return(as.data.frame(obj))
+    }
+    
+    # matrix -> data frame
+    if (is.matrix(obj)) {
+      return(as.data.frame(obj))
+    }
+    
+    # list that can be converted
+    try_df <- try(as.data.frame(obj), silent = TRUE)
+    if (!inherits(try_df, "try-error")) {
+      return(as.data.frame(try_df))
+    }
+    
+    stop("Uploaded file could not be converted to a data frame.")
+  }
+  
   # -------- Load Data --------
   raw_data <- reactive({
-    
     if (input$builtin != "None") {
-      return(get(input$builtin))
+      return(as.data.frame(get(input$builtin)))
     }
     
     req(input$file)
     
-    ext <- tools::file_ext(input$file$name)
+    ext <- tolower(tools::file_ext(input$file$name))
+    path <- input$file$datapath
     
-    if (ext == "csv") {
-      df <- read_csv(input$file$datapath, show_col_types = FALSE)
-    } else if (ext == "xlsx") {
-      df <- read_excel(input$file$datapath)
-    } else {
-      return(NULL)
-    }
+    df <- switch(
+      ext,
+      "csv" = read_csv(path, show_col_types = FALSE),
+      "xlsx" = read_excel(path),
+      "json" = {
+        json_obj <- fromJSON(path, flatten = TRUE)
+        to_dataframe(json_obj)
+      },
+      "rds" = {
+        rds_obj <- readRDS(path)
+        to_dataframe(rds_obj)
+      },
+      stop("Unsupported file type. Please upload CSV, XLSX, JSON, or RDS.")
+    )
     
-    return(as.data.frame(df))
+    as.data.frame(df)
   })
   
   # -------- Cleaning --------
@@ -105,20 +138,16 @@ server <- function(input, output, session) {
     var <- input$num_var
     new_name <- input$new_var
     
-    if (!is.null(var) && var %in% colnames(df) && input$log_transform) {
-      if (is.numeric(df[[var]]) && !is.null(new_name) && new_name != "") {
-        df[[new_name]] <- log(df[[var]] + 1)
-      }
+    if (!is.null(var) &&
+        var %in% colnames(df) &&
+        input$log_transform &&
+        is.numeric(df[[var]]) &&
+        !is.null(new_name) &&
+        new_name != "") {
+      df[[new_name]] <- log(df[[var]] + 1)
     }
     
     df
-  })
-  
-  # -------- Numeric Variables --------
-  numeric_vars <- reactive({
-    df <- feature_data()
-    req(df)
-    names(df)[sapply(df, is.numeric)]
   })
   
   # -------- Update UI Choices --------
@@ -129,20 +158,29 @@ server <- function(input, output, session) {
     all_vars <- names(df)
     num_vars <- names(df)[sapply(df, is.numeric)]
     
-    updateSelectInput(session, "num_var",
-                      choices = num_vars,
-                      selected = if (length(num_vars) > 0) num_vars[1] else NULL)
+    updateSelectInput(
+      session,
+      "num_var",
+      choices = num_vars,
+      selected = if (length(num_vars) > 0) num_vars[1] else NULL
+    )
     
-    updateSelectInput(session, "xvar",
-                      choices = all_vars,
-                      selected = if (length(all_vars) > 0) all_vars[1] else NULL)
+    updateSelectInput(
+      session,
+      "xvar",
+      choices = all_vars,
+      selected = if (length(all_vars) > 0) all_vars[1] else NULL
+    )
     
-    updateSelectInput(session, "yvar",
-                      choices = all_vars,
-                      selected = if (length(all_vars) > 1) all_vars[2] else all_vars[1])
+    updateSelectInput(
+      session,
+      "yvar",
+      choices = all_vars,
+      selected = if (length(all_vars) > 1) all_vars[2] else if (length(all_vars) > 0) all_vars[1] else NULL
+    )
   })
   
-  # -------- Table --------
+  # -------- Data Preview --------
   output$table <- renderDT({
     datatable(feature_data(), options = list(pageLength = 5, scrollX = TRUE))
   })
@@ -175,17 +213,11 @@ server <- function(input, output, session) {
     req(input$xvar)
     
     if (!(input$xvar %in% names(df))) {
-      return(
-        plotly_empty() %>%
-          layout(title = "Please select a valid X variable.")
-      )
+      return(plotly_empty() %>% layout(title = "Please select a valid X variable."))
     }
     
     if (!is.numeric(df[[input$xvar]])) {
-      return(
-        plotly_empty() %>%
-          layout(title = "Histogram requires a numeric variable.")
-      )
+      return(plotly_empty() %>% layout(title = "Histogram requires a numeric variable."))
     }
     
     p <- ggplot(df, aes_string(x = input$xvar)) +
@@ -206,17 +238,11 @@ server <- function(input, output, session) {
     req(input$xvar, input$yvar)
     
     if (!(input$xvar %in% names(df)) || !(input$yvar %in% names(df))) {
-      return(
-        plotly_empty() %>%
-          layout(title = "Please select valid variables.")
-      )
+      return(plotly_empty() %>% layout(title = "Please select valid variables."))
     }
     
     if (!is.numeric(df[[input$xvar]]) || !is.numeric(df[[input$yvar]])) {
-      return(
-        plotly_empty() %>%
-          layout(title = "Scatter plot requires both X and Y to be numeric.")
-      )
+      return(plotly_empty() %>% layout(title = "Scatter plot requires both X and Y to be numeric."))
     }
     
     p <- ggplot(df, aes_string(x = input$xvar, y = input$yvar)) +
@@ -229,25 +255,6 @@ server <- function(input, output, session) {
       )
     
     ggplotly(p)
-  })
-  
-  # -------- Correlation Heatmap Data --------
-  corr_data <- reactive({
-    df <- feature_data()
-    req(df)
-    
-    num_df <- df %>% select(where(is.numeric))
-    
-    validate(
-      need(ncol(num_df) >= 2, "Need at least 2 numeric variables to compute correlation.")
-    )
-    
-    corr_mat <- cor(num_df, use = "pairwise.complete.obs")
-    
-    corr_long <- as.data.frame(as.table(corr_mat))
-    names(corr_long) <- c("Var1", "Var2", "Correlation")
-    
-    corr_long
   })
   
   # -------- Correlation Heatmap --------
