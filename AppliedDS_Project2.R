@@ -23,7 +23,8 @@ ui <- fluidPage(
       selectInput(
         "builtin",
         "Or use built-in dataset",
-        choices = c("None", "iris", "mtcars")
+        choices = c("None", "iris", "mtcars"),
+        selected = "iris"
       ),
       
       hr(),
@@ -75,14 +76,56 @@ ui <- fluidPage(
       
       hr(),
       
-      h4("4. Feature Engineering"),
-      selectInput("num_var", "Select numeric variable", choices = NULL),
-      checkboxInput("log_transform", "Log transform"),
-      textInput("new_var", "New variable name", "new_var"),
+      h4("4. Outlier Handling"),
+      checkboxInput("handle_outliers", "Identify / handle outliers (IQR method)", value = FALSE),
+      selectInput(
+        "outlier_cols",
+        "Numeric columns for outlier handling",
+        choices = NULL,
+        multiple = TRUE
+      ),
+      selectInput(
+        "outlier_action",
+        "Outlier handling method",
+        choices = c(
+          "Only identify, do not modify" = "identify_only",
+          "Remove rows containing outliers" = "remove_rows"
+        ),
+        selected = "identify_only"
+      ),
       
       hr(),
       
-      h4("5. Visualization"),
+      h4("5. Feature Engineering"),
+      selectInput("num_var", "Select numeric variable", choices = NULL),
+      checkboxInput("log_transform", "Log transform", value = FALSE),
+      textInput("new_var", "New variable name", "log_var"),
+      
+      hr(),
+      
+      h4("6. Scaling"),
+      checkboxInput("apply_scaling", "Apply scaling to numeric variable", value = FALSE),
+      selectInput("scale_var", "Select numeric variable to scale", choices = NULL),
+      selectInput(
+        "scale_method",
+        "Scaling method",
+        choices = c(
+          "Standardization (z-score)" = "zscore",
+          "Min-Max Scaling (0 to 1)" = "minmax"
+        ),
+        selected = "zscore"
+      ),
+      textInput("scaled_var_name", "Scaled variable name", "scaled_var"),
+      
+      hr(),
+      
+      h4("7. Filter Data"),
+      selectInput("filter_var", "Filter variable", choices = NULL),
+      selectInput("filter_value", "Filter value", choices = NULL),
+      
+      hr(),
+      
+      h4("8. Visualization"),
       selectInput("xvar", "X variable", choices = NULL),
       selectInput("yvar", "Y variable", choices = NULL),
       
@@ -93,6 +136,20 @@ ui <- fluidPage(
     
     mainPanel(
       tabsetPanel(
+        tabPanel(
+          "User Guide",
+          br(),
+          tags$h4("How to Use the App"),
+          tags$ol(
+            tags$li("Upload your own dataset or choose a built-in dataset."),
+            tags$li("Inspect missing values and duplicates before cleaning."),
+            tags$li("Optionally identify or remove outliers using the IQR method."),
+            tags$li("Create new features using log transformation or scaling."),
+            tags$li("Use filtering and visualization tools to explore the data."),
+            tags$li("Download the processed dataset when finished.")
+          ),
+          tags$p("Supported file types: CSV, Excel, JSON, and RDS.")
+        ),
         tabPanel("Data Preview", DTOutput("table")),
         tabPanel("Summary", verbatimTextOutput("summary")),
         tabPanel(
@@ -107,6 +164,12 @@ ui <- fluidPage(
           verbatimTextOutput("dup_stats"),
           DTOutput("dup_table")
         ),
+        tabPanel(
+          "Outlier Summary",
+          br(),
+          verbatimTextOutput("outlier_stats"),
+          DTOutput("outlier_table")
+        ),
         tabPanel("Histogram", plotlyOutput("hist")),
         tabPanel("Scatter", plotlyOutput("scatter")),
         tabPanel("Correlation Heatmap", plotlyOutput("corr_heatmap"))
@@ -119,13 +182,8 @@ server <- function(input, output, session) {
   
   # -------- Helper: safely convert object to data frame --------
   to_dataframe <- function(obj) {
-    if (is.data.frame(obj)) {
-      return(as.data.frame(obj))
-    }
-    
-    if (is.matrix(obj)) {
-      return(as.data.frame(obj))
-    }
+    if (is.data.frame(obj)) return(as.data.frame(obj))
+    if (is.matrix(obj)) return(as.data.frame(obj))
     
     try_df <- try(as.data.frame(obj), silent = TRUE)
     if (!inherits(try_df, "try-error")) {
@@ -145,13 +203,11 @@ server <- function(input, output, session) {
   
   # -------- Helper: custom fill with correct type --------
   cast_custom_value <- function(fill_value, target_col) {
-    if (is.numeric(target_col)) {
-      val <- suppressWarnings(as.numeric(fill_value))
-      return(val)
-    }
     if (is.integer(target_col)) {
-      val <- suppressWarnings(as.integer(fill_value))
-      return(val)
+      return(suppressWarnings(as.integer(fill_value)))
+    }
+    if (is.numeric(target_col)) {
+      return(suppressWarnings(as.numeric(fill_value)))
     }
     if (is.logical(target_col)) {
       val_lower <- tolower(trimws(fill_value))
@@ -159,12 +215,23 @@ server <- function(input, output, session) {
       if (val_lower %in% c("false", "f", "0")) return(FALSE)
       return(NA)
     }
-    return(as.character(fill_value))
+    as.character(fill_value)
+  }
+  
+  # -------- Helper: identify outliers by IQR --------
+  iqr_outlier_flag <- function(x) {
+    if (!is.numeric(x)) return(rep(FALSE, length(x)))
+    q1 <- quantile(x, 0.25, na.rm = TRUE)
+    q3 <- quantile(x, 0.75, na.rm = TRUE)
+    iqr <- q3 - q1
+    lower <- q1 - 1.5 * iqr
+    upper <- q3 + 1.5 * iqr
+    x < lower | x > upper
   }
   
   # -------- Load Data --------
   raw_data <- reactive({
-    if (input$builtin != "None") {
+    if (!is.null(input$builtin) && input$builtin != "None") {
       return(as.data.frame(get(input$builtin)))
     }
     
@@ -210,18 +277,14 @@ server <- function(input, output, session) {
     df <- raw_data()
     req(df)
     
-    if (!isTRUE(input$handle_na)) {
-      return(df)
-    }
+    if (!isTRUE(input$handle_na)) return(df)
     
     na_cols <- input$na_cols
     if (is.null(na_cols) || length(na_cols) == 0) {
       na_cols <- names(df)
     }
     
-    if (input$na_action == "identify_only") {
-      return(df)
-    }
+    if (input$na_action == "identify_only") return(df)
     
     if (input$na_action == "drop_rows") {
       df <- df %>% filter(if_all(all_of(na_cols), ~ !is.na(.)))
@@ -275,19 +338,16 @@ server <- function(input, output, session) {
     req(df)
     
     dup_cols <- input$dup_cols
-    
     if (is.null(dup_cols) || length(dup_cols) == 0) {
       dup_cols <- names(df)
     }
     
     subset_df <- df[, dup_cols, drop = FALSE]
     
-    df_check <- df %>%
+    df %>%
       mutate(
         duplicate_flag = duplicated(subset_df) | duplicated(subset_df, fromLast = TRUE)
       )
-    
-    df_check
   })
   
   # -------- Duplicate Handling --------
@@ -321,10 +381,55 @@ server <- function(input, output, session) {
           filter(.dup_count_temp == 1) %>%
           select(-.dup_count_temp)
       }
-      
-      if (input$dup_action == "identify_only") {
-        df <- df
+    }
+    
+    df
+  })
+  
+  # -------- Outlier Summary --------
+  outlier_summary <- reactive({
+    df <- clean_data()
+    req(df)
+    
+    outlier_cols <- input$outlier_cols
+    if (is.null(outlier_cols) || length(outlier_cols) == 0) {
+      outlier_cols <- names(df)[sapply(df, is.numeric)]
+    }
+    
+    if (length(outlier_cols) == 0) {
+      return(data.frame(Message = "No numeric columns available.", stringsAsFactors = FALSE))
+    }
+    
+    result <- data.frame(
+      Variable = outlier_cols,
+      Outlier_Count = sapply(outlier_cols, function(col) sum(iqr_outlier_flag(df[[col]]), na.rm = TRUE)),
+      stringsAsFactors = FALSE
+    )
+    
+    result
+  })
+  
+  # -------- Outlier Handling --------
+  outlier_handled_data <- reactive({
+    df <- clean_data()
+    req(df)
+    
+    if (!isTRUE(input$handle_outliers)) return(df)
+    
+    outlier_cols <- input$outlier_cols
+    if (is.null(outlier_cols) || length(outlier_cols) == 0) {
+      outlier_cols <- names(df)[sapply(df, is.numeric)]
+    }
+    
+    if (input$outlier_action == "identify_only") return(df)
+    
+    if (input$outlier_action == "remove_rows" && length(outlier_cols) > 0) {
+      flag_matrix <- sapply(outlier_cols, function(col) iqr_outlier_flag(df[[col]]))
+      if (is.vector(flag_matrix)) {
+        flag_matrix <- matrix(flag_matrix, ncol = 1)
       }
+      remove_flag <- apply(flag_matrix, 1, any, na.rm = TRUE)
+      df <- df[!remove_flag, , drop = FALSE]
     }
     
     df
@@ -332,19 +437,51 @@ server <- function(input, output, session) {
   
   # -------- Feature Engineering --------
   feature_data <- reactive({
-    df <- clean_data()
+    df <- outlier_handled_data()
     req(df)
     
     var <- input$num_var
     new_name <- trimws(input$new_var)
     
     if (!is.null(var) &&
-        var %in% colnames(df) &&
-        input$log_transform &&
+        var %in% names(df) &&
+        isTRUE(input$log_transform) &&
         is.numeric(df[[var]]) &&
         !is.null(new_name) &&
         new_name != "") {
       df[[new_name]] <- log(df[[var]] + 1)
+    }
+    
+    if (isTRUE(input$apply_scaling) &&
+        !is.null(input$scale_var) &&
+        input$scale_var %in% names(df) &&
+        is.numeric(df[[input$scale_var]])) {
+      
+      scaled_name <- trimws(input$scaled_var_name)
+      if (!is.null(scaled_name) && scaled_name != "") {
+        x <- df[[input$scale_var]]
+        
+        if (input$scale_method == "zscore") {
+          s <- sd(x, na.rm = TRUE)
+          if (!is.na(s) && s != 0) {
+            df[[scaled_name]] <- as.numeric((x - mean(x, na.rm = TRUE)) / s)
+          }
+        }
+        
+        if (input$scale_method == "minmax") {
+          xmin <- min(x, na.rm = TRUE)
+          xmax <- max(x, na.rm = TRUE)
+          if (!is.na(xmin) && !is.na(xmax) && xmax != xmin) {
+            df[[scaled_name]] <- as.numeric((x - xmin) / (xmax - xmin))
+          }
+        }
+      }
+    }
+    
+    if (!is.null(input$filter_var) &&
+        !is.null(input$filter_value) &&
+        input$filter_var %in% names(df)) {
+      df <- df[df[[input$filter_var]] == input$filter_value, , drop = FALSE]
     }
     
     df
@@ -356,79 +493,63 @@ server <- function(input, output, session) {
     req(df)
     
     all_vars <- names(df)
-    num_vars <- names(feature_data())[sapply(feature_data(), is.numeric)]
+    current_feature <- feature_data()
+    feature_names <- names(current_feature)
+    numeric_vars <- feature_names[sapply(current_feature, is.numeric)]
     
-    current_num <- isolate(input$num_var)
-    current_x <- isolate(input$xvar)
-    current_y <- isolate(input$yvar)
-    current_dup <- isolate(input$dup_cols)
-    current_na <- isolate(input$na_cols)
-    
+    updateSelectInput(session, "na_cols", choices = all_vars, selected = all_vars)
+    updateSelectInput(session, "dup_cols", choices = all_vars, selected = all_vars)
     updateSelectInput(
-      session,
-      "na_cols",
-      choices = all_vars,
-      selected = if (!is.null(current_na) && all(current_na %in% all_vars)) {
-        current_na
-      } else {
-        all_vars
-      }
+      session, "outlier_cols",
+      choices = names(df)[sapply(df, is.numeric)],
+      selected = names(df)[sapply(df, is.numeric)]
     )
-    
     updateSelectInput(
-      session,
-      "dup_cols",
-      choices = all_vars,
-      selected = if (!is.null(current_dup) && all(current_dup %in% all_vars)) {
-        current_dup
-      } else {
-        all_vars
-      }
+      session, "num_var",
+      choices = numeric_vars,
+      selected = if (length(numeric_vars) > 0) numeric_vars[1] else NULL
     )
-    
     updateSelectInput(
-      session,
-      "num_var",
-      choices = num_vars,
-      selected = if (!is.null(current_num) && current_num %in% num_vars) {
-        current_num
-      } else if (length(num_vars) > 0) {
-        num_vars[1]
-      } else {
-        NULL
-      }
+      session, "scale_var",
+      choices = numeric_vars,
+      selected = if (length(numeric_vars) > 0) numeric_vars[1] else NULL
     )
-    
     updateSelectInput(
-      session,
-      "xvar",
-      choices = names(feature_data()),
-      selected = if (!is.null(current_x) && current_x %in% names(feature_data())) {
-        current_x
-      } else if (length(names(feature_data())) > 0) {
-        names(feature_data())[1]
-      } else {
-        NULL
-      }
+      session, "xvar",
+      choices = feature_names,
+      selected = if (length(feature_names) > 0) feature_names[1] else NULL
     )
-    
     updateSelectInput(
-      session,
-      "yvar",
-      choices = names(feature_data()),
-      selected = if (!is.null(current_y) && current_y %in% names(feature_data())) {
-        current_y
-      } else if (length(names(feature_data())) > 1) {
-        names(feature_data())[2]
-      } else if (length(names(feature_data())) > 0) {
-        names(feature_data())[1]
-      } else {
-        NULL
-      }
+      session, "yvar",
+      choices = feature_names,
+      selected = if (length(feature_names) > 1) feature_names[2] else if (length(feature_names) > 0) feature_names[1] else NULL
+    )
+    updateSelectInput(
+      session, "filter_var",
+      choices = names(outlier_handled_data()),
+      selected = if ("Species" %in% names(outlier_handled_data())) "Species" else if (length(names(outlier_handled_data())) > 0) names(outlier_handled_data())[1] else NULL
     )
   })
   
-  # -------- Data Preview --------
+  # -------- Update Filter Values --------
+  observe({
+    df <- outlier_handled_data()
+    req(df, input$filter_var)
+    
+    if (input$filter_var %in% names(df)) {
+      vals <- unique(df[[input$filter_var]])
+      vals <- vals[!is.na(vals)]
+      default_val <- if ("setosa" %in% vals) "setosa" else if (length(vals) > 0) vals[1] else NULL
+      
+      updateSelectInput(
+        session, "filter_value",
+        choices = vals,
+        selected = default_val
+      )
+    }
+  })
+  
+  # -------- Outputs --------
   output$table <- renderDT({
     datatable(
       feature_data(),
@@ -436,21 +557,16 @@ server <- function(input, output, session) {
     )
   })
   
-  # -------- Summary --------
   output$summary <- renderPrint({
     summary(feature_data())
   })
   
-  # -------- Missing Stats --------
   output$na_stats <- renderPrint({
     df <- raw_data()
     req(df)
     
-    total_missing <- sum(is.na(df))
-    cols_with_missing <- sum(sapply(df, function(x) any(is.na(x))))
-    
-    cat("Total missing values:", total_missing, "\n")
-    cat("Columns with missing values:", cols_with_missing, "\n")
+    cat("Total missing values:", sum(is.na(df)), "\n")
+    cat("Columns with missing values:", sum(sapply(df, function(x) any(is.na(x)))), "\n")
     
     if (isTRUE(input$handle_na)) {
       cat("Current missing-value handling method:", input$na_action, "\n")
@@ -459,7 +575,6 @@ server <- function(input, output, session) {
     }
   })
   
-  # -------- Missing Table --------
   output$missing_table <- renderDT({
     datatable(
       missing_summary(),
@@ -467,7 +582,6 @@ server <- function(input, output, session) {
     )
   })
   
-  # -------- Duplicate Stats --------
   output$dup_stats <- renderPrint({
     df_dup <- duplicate_summary()
     req(df_dup)
@@ -487,7 +601,6 @@ server <- function(input, output, session) {
     }
   })
   
-  # -------- Duplicate Table --------
   output$dup_table <- renderDT({
     df_dup <- duplicate_summary()
     req(df_dup)
@@ -507,7 +620,33 @@ server <- function(input, output, session) {
     )
   })
   
-  # -------- Histogram --------
+  output$outlier_stats <- renderPrint({
+    df <- clean_data()
+    req(df)
+    
+    outlier_df <- outlier_summary()
+    
+    if ("Message" %in% names(outlier_df)) {
+      cat(outlier_df$Message[1], "\n")
+    } else {
+      cat("Columns checked for outliers:", nrow(outlier_df), "\n")
+      cat("Total outliers detected:", sum(outlier_df$Outlier_Count, na.rm = TRUE), "\n")
+    }
+    
+    if (isTRUE(input$handle_outliers)) {
+      cat("Current outlier handling method:", input$outlier_action, "\n")
+    } else {
+      cat("Outlier handling is currently off.\n")
+    }
+  })
+  
+  output$outlier_table <- renderDT({
+    datatable(
+      outlier_summary(),
+      options = list(pageLength = 10, scrollX = TRUE)
+    )
+  })
+  
   output$hist <- renderPlotly({
     df <- feature_data()
     req(input$xvar)
@@ -532,7 +671,6 @@ server <- function(input, output, session) {
     ggplotly(p)
   })
   
-  # -------- Scatter --------
   output$scatter <- renderPlotly({
     df <- feature_data()
     req(input$xvar, input$yvar)
@@ -557,7 +695,6 @@ server <- function(input, output, session) {
     ggplotly(p)
   })
   
-  # -------- Correlation Heatmap --------
   output$corr_heatmap <- renderPlotly({
     df <- feature_data()
     req(df)
@@ -598,7 +735,6 @@ server <- function(input, output, session) {
     ggplotly(p, tooltip = "text")
   })
   
-  # -------- Download --------
   output$download <- downloadHandler(
     filename = function() {
       "cleaned_data.csv"
@@ -610,3 +746,4 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui = ui, server = server)
+
