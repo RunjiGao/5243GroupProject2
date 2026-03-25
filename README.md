@@ -222,15 +222,6 @@ The entire application is contained in a single file (`AppliedDS_Project2_final.
 
 ---
 
-## Team Contributions
-
-| Team Member | Contributions |
-|-------------|---------------|
-| [Team Member 1] | Server-side reactive logic: data loading pipeline, all cleaning steps (missing values, duplicates, outliers, Winsorization, encoding, scaling), feature engineering transformations, reactive chain architecture, and bug fixes. |
-| [Team Member 2] | UI design and EDA: shinydashboard layout, custom CSS, conditionalPanel sidebar structure, bsTooltip integration, all seven plotly chart implementations (histogram, density, scatter, boxplot, violin, bar chart, heatmap), User Guide content, and deployment to shinyapps.io. |
-
----
-
 ## Deployment
 
 The application is deployed on [shinyapps.io](https://www.shinyapps.io/).
