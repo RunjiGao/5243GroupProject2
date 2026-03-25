@@ -2,7 +2,7 @@
 
 A no-code interactive data science web application built with R Shiny. Upload any tabular dataset, clean and preprocess it, engineer new features, and explore distributions — all through a point-and-click interface.
 
-🔗 **Live App:**  
+🔗 **Live App:**  https://5243groupproject2.shinyapps.io/5243GroupProject2/
 📄 **Project Report:** See `report/DataPilot_Report.docx`
 
 ---
