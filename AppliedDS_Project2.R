@@ -126,9 +126,23 @@ ui <- fluidPage(
       hr(),
       
       h4("6. Feature Engineering"),
-      selectInput("num_var", "Select numeric variable", choices = NULL),
-      checkboxInput("log_transform", "Log transform", value = FALSE),
-      textInput("new_var", "New variable name", "log_var"),
+      checkboxInput("apply_feature_engineering", "Apply feature engineering", value = FALSE),
+      selectInput(
+        "feature_method",
+        "Feature engineering method",
+        choices = c(
+          "Log transform" = "log",
+          "Square root transform" = "sqrt",
+          "Square transform" = "square",
+          "Interaction term" = "interaction",
+          "Binning" = "binning"
+        ),
+        selected = "log"
+      ),
+      selectInput("num_var", "Primary numeric variable", choices = NULL),
+      selectInput("num_var_2", "Second numeric variable (for interaction)", choices = NULL),
+      numericInput("bin_count", "Number of bins", value = 4, min = 2, max = 20, step = 1),
+      textInput("new_var", "New variable name", "engineered_var"),
       
       hr(),
       
@@ -159,6 +173,21 @@ ui <- fluidPage(
       selectInput("xvar", "X variable", choices = NULL),
       selectInput("yvar", "Y variable", choices = NULL),
       
+      tags$hr(),
+      h5("Grouped Boxplot"),
+      selectInput("box_cat_var", "Categorical variable", choices = NULL),
+      selectInput("box_num_var", "Numeric variable", choices = NULL),
+      
+      hr(),
+      
+      h4("10. Transformation Comparison"),
+      selectInput(
+        "comparison_target",
+        "Compare transformation",
+        choices = c("None" = "none"),
+        selected = "none"
+      ),
+      
       hr(),
       
       downloadButton("download", "Download Data")
@@ -175,8 +204,11 @@ ui <- fluidPage(
             tags$li("Inspect missing values and duplicates before cleaning."),
             tags$li("Optionally identify or remove outliers using the IQR method."),
             tags$li("Use categorical encoding for character, factor, or logical variables."),
-            tags$li("Create new features using log transformation or scaling."),
+            tags$li("Create new features using log, sqrt, square, interaction, or binning."),
+            tags$li("Apply scaling to numeric variables if needed."),
+            tags$li("Use transformation comparison to see before-vs-after distributions and summaries."),
             tags$li("Use filtering and visualization tools to explore the data."),
+            tags$li("Use grouped boxplots to compare numeric distributions across groups."),
             tags$li("Download the processed dataset when finished.")
           ),
           tags$p("Supported file types: CSV, Excel, JSON, and RDS.")
@@ -201,8 +233,17 @@ ui <- fluidPage(
           verbatimTextOutput("outlier_stats"),
           DTOutput("outlier_table")
         ),
+        tabPanel(
+          "Transformation Comparison",
+          br(),
+          verbatimTextOutput("comparison_note"),
+          DTOutput("comparison_table"),
+          br(),
+          plotlyOutput("comparison_hist")
+        ),
         tabPanel("Histogram", plotlyOutput("hist")),
         tabPanel("Scatter", plotlyOutput("scatter")),
+        tabPanel("Grouped Boxplot", plotlyOutput("grouped_boxplot")),
         tabPanel("Correlation Heatmap", plotlyOutput("corr_heatmap"))
       )
     )
@@ -271,6 +312,48 @@ server <- function(input, output, session) {
     x <- gsub("_+", "_", x)
     x <- gsub("^_|_$", "", x)
     make.unique(x, sep = "_")
+  }
+  
+  # -------- Helper: summary table for one variable --------
+  make_variable_summary <- function(x, var_name, role_name) {
+    if (is.numeric(x)) {
+      data.frame(
+        Role = role_name,
+        Variable = var_name,
+        Type = "Numeric",
+        Missing = sum(is.na(x)),
+        Unique = dplyr::n_distinct(x, na.rm = TRUE),
+        Mean = round(mean(x, na.rm = TRUE), 4),
+        Median = round(median(x, na.rm = TRUE), 4),
+        SD = round(sd(x, na.rm = TRUE), 4),
+        Min = round(min(x, na.rm = TRUE), 4),
+        Max = round(max(x, na.rm = TRUE), 4),
+        Top_Level = NA,
+        Top_Count = NA,
+        stringsAsFactors = FALSE
+      )
+    } else {
+      x_char <- as.character(x)
+      x_non_na <- x_char[!is.na(x_char)]
+      top_level <- if (length(x_non_na) == 0) NA else names(sort(table(x_non_na), decreasing = TRUE))[1]
+      top_count <- if (length(x_non_na) == 0) NA else as.integer(sort(table(x_non_na), decreasing = TRUE)[1])
+      
+      data.frame(
+        Role = role_name,
+        Variable = var_name,
+        Type = "Categorical",
+        Missing = sum(is.na(x)),
+        Unique = dplyr::n_distinct(x, na.rm = TRUE),
+        Mean = NA,
+        Median = NA,
+        SD = NA,
+        Min = NA,
+        Max = NA,
+        Top_Level = top_level,
+        Top_Count = top_count,
+        stringsAsFactors = FALSE
+      )
+    }
   }
   
   # -------- Load Data --------
@@ -531,16 +614,54 @@ server <- function(input, output, session) {
     df <- encoded_data()
     req(df)
     
-    var <- input$num_var
-    new_name <- trimws(input$new_var)
-    
-    if (!is.null(var) &&
-        var %in% names(df) &&
-        isTRUE(input$log_transform) &&
-        is.numeric(df[[var]]) &&
-        !is.null(new_name) &&
-        new_name != "") {
-      df[[new_name]] <- log(df[[var]] + 1)
+    if (isTRUE(input$apply_feature_engineering)) {
+      method <- input$feature_method
+      var1 <- input$num_var
+      var2 <- input$num_var_2
+      new_name <- trimws(input$new_var)
+      
+      if (is.null(new_name) || new_name == "") {
+        new_name <- "engineered_var"
+      }
+      
+      if (!is.null(var1) && var1 %in% names(df) && is.numeric(df[[var1]])) {
+        
+        if (method == "log") {
+          df[[new_name]] <- ifelse(df[[var1]] > -1, log(df[[var1]] + 1), NA_real_)
+        }
+        
+        if (method == "sqrt") {
+          df[[new_name]] <- ifelse(df[[var1]] >= 0, sqrt(df[[var1]]), NA_real_)
+        }
+        
+        if (method == "square") {
+          df[[new_name]] <- df[[var1]] ^ 2
+        }
+        
+        if (method == "interaction" &&
+            !is.null(var2) &&
+            var2 %in% names(df) &&
+            is.numeric(df[[var2]])) {
+          df[[new_name]] <- df[[var1]] * df[[var2]]
+        }
+        
+        if (method == "binning") {
+          n_bins <- input$bin_count
+          if (is.null(n_bins) || is.na(n_bins) || n_bins < 2) {
+            n_bins <- 4
+          }
+          
+          x <- df[[var1]]
+          if (length(unique(x[!is.na(x)])) >= 2) {
+            df[[new_name]] <- cut(
+              x,
+              breaks = n_bins,
+              include.lowest = TRUE,
+              ordered_result = TRUE
+            )
+          }
+        }
+      }
     }
     
     if (isTRUE(input$apply_scaling) &&
@@ -583,10 +704,46 @@ server <- function(input, output, session) {
         input$filter_var %in% names(df)) {
       
       filter_col <- df[[input$filter_var]]
-      df <- df[!is.na(filter_col) & as.character(filter_col) == as.character(input$filter_value), , drop = FALSE]
+      df <- df[
+        !is.na(filter_col) &
+          as.character(filter_col) == as.character(input$filter_value),
+        ,
+        drop = FALSE
+      ]
     }
     
     df
+  })
+  
+  # -------- Comparison choices --------
+  comparison_choices <- reactive({
+    df <- pre_filter_data()
+    req(df)
+    
+    choices <- c("None" = "none")
+    
+    new_name <- trimws(input$new_var)
+    scaled_name <- trimws(input$scaled_var_name)
+    
+    if (isTRUE(input$apply_feature_engineering) &&
+        !is.null(input$num_var) &&
+        input$num_var %in% names(df) &&
+        !is.null(new_name) &&
+        new_name != "" &&
+        new_name %in% names(df)) {
+      choices["Feature Engineering"] <- "feature"
+    }
+    
+    if (isTRUE(input$apply_scaling) &&
+        !is.null(input$scale_var) &&
+        input$scale_var %in% names(df) &&
+        !is.null(scaled_name) &&
+        scaled_name != "" &&
+        scaled_name %in% names(df)) {
+      choices["Scaling"] <- "scaling"
+    }
+    
+    choices
   })
   
   # -------- Update UI Choices --------
@@ -601,6 +758,7 @@ server <- function(input, output, session) {
     df_pre_filter <- pre_filter_data()
     feature_names <- names(df_pre_filter)
     numeric_feature_vars <- feature_names[sapply(df_pre_filter, is.numeric)]
+    categorical_feature_vars <- feature_names[sapply(df_pre_filter, is_categorical_col)]
     
     updateSelectInput(session, "na_cols", choices = all_vars, selected = all_vars)
     updateSelectInput(session, "dup_cols", choices = all_vars, selected = all_vars)
@@ -624,6 +782,14 @@ server <- function(input, output, session) {
     )
     
     updateSelectInput(
+      session, "num_var_2",
+      choices = numeric_feature_vars,
+      selected = if (length(numeric_feature_vars) > 1) numeric_feature_vars[2]
+      else if (length(numeric_feature_vars) > 0) numeric_feature_vars[1]
+      else NULL
+    )
+    
+    updateSelectInput(
       session, "scale_var",
       choices = numeric_feature_vars,
       selected = if (length(numeric_feature_vars) > 0) numeric_feature_vars[1] else NULL
@@ -644,11 +810,38 @@ server <- function(input, output, session) {
     )
     
     updateSelectInput(
+      session, "box_cat_var",
+      choices = categorical_feature_vars,
+      selected = if (length(categorical_feature_vars) > 0) categorical_feature_vars[1] else NULL
+    )
+    
+    updateSelectInput(
+      session, "box_num_var",
+      choices = numeric_feature_vars,
+      selected = if (length(numeric_feature_vars) > 0) numeric_feature_vars[1] else NULL
+    )
+    
+    updateSelectInput(
       session, "filter_var",
       choices = feature_names,
       selected = if ("Species" %in% feature_names) "Species"
       else if (length(feature_names) > 0) feature_names[1]
       else NULL
+    )
+    
+    comp_choices <- comparison_choices()
+    selected_comp <- if (!is.null(input$comparison_target) &&
+                         input$comparison_target %in% unname(comp_choices)) {
+      input$comparison_target
+    } else {
+      "none"
+    }
+    
+    updateSelectInput(
+      session,
+      "comparison_target",
+      choices = comp_choices,
+      selected = selected_comp
     )
   })
   
@@ -673,6 +866,50 @@ server <- function(input, output, session) {
         selected = default_val
       )
     }
+  })
+  
+  # -------- Comparison info --------
+  comparison_info <- reactive({
+    df <- pre_filter_data()
+    req(df)
+    
+    if (is.null(input$comparison_target) || input$comparison_target == "none") {
+      return(NULL)
+    }
+    
+    if (input$comparison_target == "feature") {
+      before_var <- input$num_var
+      after_var <- trimws(input$new_var)
+      
+      if (!is.null(before_var) &&
+          !is.null(after_var) &&
+          before_var %in% names(df) &&
+          after_var %in% names(df)) {
+        return(list(
+          label = "Feature Engineering",
+          before_var = before_var,
+          after_var = after_var
+        ))
+      }
+    }
+    
+    if (input$comparison_target == "scaling") {
+      before_var <- input$scale_var
+      after_var <- trimws(input$scaled_var_name)
+      
+      if (!is.null(before_var) &&
+          !is.null(after_var) &&
+          before_var %in% names(df) &&
+          after_var %in% names(df)) {
+        return(list(
+          label = "Scaling",
+          before_var = before_var,
+          after_var = after_var
+        ))
+      }
+    }
+    
+    NULL
   })
   
   # -------- Outputs --------
@@ -770,6 +1007,87 @@ server <- function(input, output, session) {
     )
   })
   
+  output$comparison_note <- renderPrint({
+    info <- comparison_info()
+    
+    if (is.null(info)) {
+      cat("No transformation comparison selected.\n")
+    } else {
+      cat("Current comparison:", info$label, "\n")
+      cat("Before variable:", info$before_var, "\n")
+      cat("After variable:", info$after_var, "\n")
+      
+      df <- pre_filter_data()
+      if (!(is.numeric(df[[info$before_var]]) && is.numeric(df[[info$after_var]]))) {
+        cat("Histogram comparison is only available when both variables are numeric.\n")
+      }
+    }
+  })
+  
+  output$comparison_table <- renderDT({
+    info <- comparison_info()
+    
+    if (is.null(info)) {
+      return(datatable(
+        data.frame(Message = "No transformation comparison selected.", stringsAsFactors = FALSE),
+        options = list(dom = "t")
+      ))
+    }
+    
+    df <- pre_filter_data()
+    
+    before_summary <- make_variable_summary(df[[info$before_var]], info$before_var, "Before")
+    after_summary <- make_variable_summary(df[[info$after_var]], info$after_var, "After")
+    
+    comparison_df <- bind_rows(before_summary, after_summary)
+    
+    datatable(
+      comparison_df,
+      options = list(pageLength = 10, scrollX = TRUE)
+    )
+  })
+  
+  output$comparison_hist <- renderPlotly({
+    info <- comparison_info()
+    
+    if (is.null(info)) {
+      return(plotly_empty() %>% layout(title = "No transformation comparison selected."))
+    }
+    
+    df <- pre_filter_data()
+    
+    before_x <- df[[info$before_var]]
+    after_x <- df[[info$after_var]]
+    
+    if (!(is.numeric(before_x) && is.numeric(after_x))) {
+      return(
+        plotly_empty() %>%
+          layout(title = "Before vs After histogram is available only for numeric transformations.")
+      )
+    }
+    
+    plot_df <- data.frame(
+      Value = c(before_x, after_x),
+      Stage = c(
+        rep(paste0("Before: ", info$before_var), length(before_x)),
+        rep(paste0("After: ", info$after_var), length(after_x))
+      )
+    )
+    
+    p <- ggplot(plot_df, aes(x = Value, fill = Stage)) +
+      geom_histogram(bins = 30, alpha = 0.6, position = "identity") +
+      facet_wrap(~ Stage, scales = "free") +
+      theme_minimal() +
+      labs(
+        title = paste("Before vs After Histogram -", info$label),
+        x = "Value",
+        y = "Count"
+      ) +
+      theme(legend.position = "none")
+    
+    ggplotly(p)
+  })
+  
   output$hist <- renderPlotly({
     df <- feature_data()
     req(input$xvar)
@@ -813,6 +1131,48 @@ server <- function(input, output, session) {
         title = paste("Scatter Plot:", input$xvar, "vs", input$yvar),
         x = input$xvar,
         y = input$yvar
+      )
+    
+    ggplotly(p)
+  })
+  
+  output$grouped_boxplot <- renderPlotly({
+    df <- feature_data()
+    req(input$box_cat_var, input$box_num_var)
+    
+    if (!(input$box_cat_var %in% names(df)) || !(input$box_num_var %in% names(df))) {
+      return(plotly_empty() %>% layout(title = "Please select valid variables."))
+    }
+    
+    if (!is_categorical_col(df[[input$box_cat_var]])) {
+      return(plotly_empty() %>% layout(title = "Grouped boxplot requires a categorical grouping variable."))
+    }
+    
+    if (!is.numeric(df[[input$box_num_var]])) {
+      return(plotly_empty() %>% layout(title = "Grouped boxplot requires a numeric variable to summarize."))
+    }
+    
+    plot_df <- df %>%
+      filter(!is.na(.data[[input$box_cat_var]]), !is.na(.data[[input$box_num_var]]))
+    
+    if (nrow(plot_df) == 0) {
+      return(plotly_empty() %>% layout(title = "No non-missing observations available for this grouped boxplot."))
+    }
+    
+    p <- ggplot(
+      plot_df,
+      aes_string(x = input$box_cat_var, y = input$box_num_var, fill = input$box_cat_var)
+    ) +
+      geom_boxplot(alpha = 0.7, outlier.alpha = 0.6) +
+      theme_minimal() +
+      labs(
+        title = paste("Grouped Boxplot:", input$box_num_var, "by", input$box_cat_var),
+        x = input$box_cat_var,
+        y = input$box_num_var
+      ) +
+      theme(
+        legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1)
       )
     
     ggplotly(p)
