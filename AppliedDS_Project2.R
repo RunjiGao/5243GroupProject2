@@ -96,14 +96,43 @@ ui <- fluidPage(
       
       hr(),
       
-      h4("5. Feature Engineering"),
+      h4("5. Categorical Encoding"),
+      checkboxInput("apply_encoding", "Apply categorical encoding", value = FALSE),
+      selectInput(
+        "cat_var",
+        "Select categorical variable",
+        choices = NULL
+      ),
+      selectInput(
+        "encoding_method",
+        "Encoding method",
+        choices = c(
+          "One-hot encoding" = "onehot",
+          "Label encoding" = "label"
+        ),
+        selected = "onehot"
+      ),
+      checkboxInput(
+        "drop_first_dummy",
+        "For one-hot encoding, drop first dummy column",
+        value = FALSE
+      ),
+      textInput(
+        "label_var_name",
+        "Label-encoded variable name",
+        "encoded_var"
+      ),
+      
+      hr(),
+      
+      h4("6. Feature Engineering"),
       selectInput("num_var", "Select numeric variable", choices = NULL),
       checkboxInput("log_transform", "Log transform", value = FALSE),
       textInput("new_var", "New variable name", "log_var"),
       
       hr(),
       
-      h4("6. Scaling"),
+      h4("7. Scaling"),
       checkboxInput("apply_scaling", "Apply scaling to numeric variable", value = FALSE),
       selectInput("scale_var", "Select numeric variable to scale", choices = NULL),
       selectInput(
@@ -119,13 +148,14 @@ ui <- fluidPage(
       
       hr(),
       
-      h4("7. Filter Data"),
+      h4("8. Filter Data"),
+      checkboxInput("apply_filter", "Apply filter", value = FALSE),
       selectInput("filter_var", "Filter variable", choices = NULL),
       selectInput("filter_value", "Filter value", choices = NULL),
       
       hr(),
       
-      h4("8. Visualization"),
+      h4("9. Visualization"),
       selectInput("xvar", "X variable", choices = NULL),
       selectInput("yvar", "Y variable", choices = NULL),
       
@@ -144,6 +174,7 @@ ui <- fluidPage(
             tags$li("Upload your own dataset or choose a built-in dataset."),
             tags$li("Inspect missing values and duplicates before cleaning."),
             tags$li("Optionally identify or remove outliers using the IQR method."),
+            tags$li("Use categorical encoding for character, factor, or logical variables."),
             tags$li("Create new features using log transformation or scaling."),
             tags$li("Use filtering and visualization tools to explore the data."),
             tags$li("Download the processed dataset when finished.")
@@ -227,6 +258,19 @@ server <- function(input, output, session) {
     lower <- q1 - 1.5 * iqr
     upper <- q3 + 1.5 * iqr
     x < lower | x > upper
+  }
+  
+  # -------- Helper: identify categorical variables --------
+  is_categorical_col <- function(x) {
+    is.character(x) || is.factor(x) || is.logical(x)
+  }
+  
+  # -------- Helper: safe column names --------
+  make_clean_names <- function(x) {
+    x <- gsub("[^A-Za-z0-9_]+", "_", x)
+    x <- gsub("_+", "_", x)
+    x <- gsub("^_|_$", "", x)
+    make.unique(x, sep = "_")
   }
   
   # -------- Load Data --------
@@ -400,13 +444,14 @@ server <- function(input, output, session) {
       return(data.frame(Message = "No numeric columns available.", stringsAsFactors = FALSE))
     }
     
-    result <- data.frame(
+    data.frame(
       Variable = outlier_cols,
-      Outlier_Count = sapply(outlier_cols, function(col) sum(iqr_outlier_flag(df[[col]]), na.rm = TRUE)),
+      Outlier_Count = sapply(
+        outlier_cols,
+        function(col) sum(iqr_outlier_flag(df[[col]]), na.rm = TRUE)
+      ),
       stringsAsFactors = FALSE
     )
-    
-    result
   })
   
   # -------- Outlier Handling --------
@@ -435,9 +480,55 @@ server <- function(input, output, session) {
     df
   })
   
-  # -------- Feature Engineering --------
-  feature_data <- reactive({
+  # -------- Categorical Encoding --------
+  encoded_data <- reactive({
     df <- outlier_handled_data()
+    req(df)
+    
+    if (!isTRUE(input$apply_encoding)) return(df)
+    
+    var <- input$cat_var
+    if (is.null(var) || !(var %in% names(df))) return(df)
+    if (!is_categorical_col(df[[var]])) return(df)
+    
+    x <- as.character(df[[var]])
+    
+    if (input$encoding_method == "label") {
+      new_name <- trimws(input$label_var_name)
+      if (is.null(new_name) || new_name == "") {
+        new_name <- paste0(var, "_label")
+      }
+      
+      encoded_vals <- as.integer(factor(x, exclude = NULL))
+      encoded_vals[is.na(x)] <- NA_integer_
+      df[[new_name]] <- encoded_vals
+      return(df)
+    }
+    
+    if (input$encoding_method == "onehot") {
+      x_factor <- factor(x, exclude = NULL)
+      dummy_mat <- model.matrix(~ x_factor - 1)
+      dummy_df <- as.data.frame(dummy_mat)
+      
+      new_names <- sub("^x_factor", paste0(var, "_"), names(dummy_df))
+      new_names <- make_clean_names(new_names)
+      names(dummy_df) <- new_names
+      
+      if (isTRUE(input$drop_first_dummy) && ncol(dummy_df) > 1) {
+        dummy_df <- dummy_df[, -1, drop = FALSE]
+      }
+      
+      df[[var]] <- NULL
+      df <- bind_cols(df, dummy_df)
+      return(df)
+    }
+    
+    df
+  })
+  
+  # -------- Feature Engineering + Scaling (before filtering) --------
+  pre_filter_data <- reactive({
+    df <- encoded_data()
     req(df)
     
     var <- input$num_var
@@ -478,10 +569,21 @@ server <- function(input, output, session) {
       }
     }
     
-    if (!is.null(input$filter_var) &&
+    df
+  })
+  
+  # -------- Final Data (after filtering) --------
+  feature_data <- reactive({
+    df <- pre_filter_data()
+    req(df)
+    
+    if (isTRUE(input$apply_filter) &&
+        !is.null(input$filter_var) &&
         !is.null(input$filter_value) &&
         input$filter_var %in% names(df)) {
-      df <- df[df[[input$filter_var]] == input$filter_value, , drop = FALSE]
+      
+      filter_col <- df[[input$filter_var]]
+      df <- df[!is.na(filter_col) & as.character(filter_col) == as.character(input$filter_value), , drop = FALSE]
     }
     
     df
@@ -489,60 +591,84 @@ server <- function(input, output, session) {
   
   # -------- Update UI Choices --------
   observe({
-    df <- raw_data()
-    req(df)
+    df_raw <- raw_data()
+    req(df_raw)
     
-    all_vars <- names(df)
-    current_feature <- feature_data()
-    feature_names <- names(current_feature)
-    numeric_vars <- feature_names[sapply(current_feature, is.numeric)]
+    all_vars <- names(df_raw)
+    numeric_raw_vars <- all_vars[sapply(df_raw, is.numeric)]
+    categorical_vars <- all_vars[sapply(df_raw, is_categorical_col)]
+    
+    df_pre_filter <- pre_filter_data()
+    feature_names <- names(df_pre_filter)
+    numeric_feature_vars <- feature_names[sapply(df_pre_filter, is.numeric)]
     
     updateSelectInput(session, "na_cols", choices = all_vars, selected = all_vars)
     updateSelectInput(session, "dup_cols", choices = all_vars, selected = all_vars)
+    
     updateSelectInput(
       session, "outlier_cols",
-      choices = names(df)[sapply(df, is.numeric)],
-      selected = names(df)[sapply(df, is.numeric)]
+      choices = numeric_raw_vars,
+      selected = numeric_raw_vars
     )
+    
+    updateSelectInput(
+      session, "cat_var",
+      choices = categorical_vars,
+      selected = if (length(categorical_vars) > 0) categorical_vars[1] else NULL
+    )
+    
     updateSelectInput(
       session, "num_var",
-      choices = numeric_vars,
-      selected = if (length(numeric_vars) > 0) numeric_vars[1] else NULL
+      choices = numeric_feature_vars,
+      selected = if (length(numeric_feature_vars) > 0) numeric_feature_vars[1] else NULL
     )
+    
     updateSelectInput(
       session, "scale_var",
-      choices = numeric_vars,
-      selected = if (length(numeric_vars) > 0) numeric_vars[1] else NULL
+      choices = numeric_feature_vars,
+      selected = if (length(numeric_feature_vars) > 0) numeric_feature_vars[1] else NULL
     )
+    
     updateSelectInput(
       session, "xvar",
       choices = feature_names,
       selected = if (length(feature_names) > 0) feature_names[1] else NULL
     )
+    
     updateSelectInput(
       session, "yvar",
       choices = feature_names,
-      selected = if (length(feature_names) > 1) feature_names[2] else if (length(feature_names) > 0) feature_names[1] else NULL
+      selected = if (length(feature_names) > 1) feature_names[2]
+      else if (length(feature_names) > 0) feature_names[1]
+      else NULL
     )
+    
     updateSelectInput(
       session, "filter_var",
-      choices = names(outlier_handled_data()),
-      selected = if ("Species" %in% names(outlier_handled_data())) "Species" else if (length(names(outlier_handled_data())) > 0) names(outlier_handled_data())[1] else NULL
+      choices = feature_names,
+      selected = if ("Species" %in% feature_names) "Species"
+      else if (length(feature_names) > 0) feature_names[1]
+      else NULL
     )
   })
   
   # -------- Update Filter Values --------
   observe({
-    df <- outlier_handled_data()
+    df <- pre_filter_data()
     req(df, input$filter_var)
     
     if (input$filter_var %in% names(df)) {
       vals <- unique(df[[input$filter_var]])
       vals <- vals[!is.na(vals)]
-      default_val <- if ("setosa" %in% vals) "setosa" else if (length(vals) > 0) vals[1] else NULL
+      vals <- as.character(vals)
+      
+      default_val <- if ("setosa" %in% vals) "setosa"
+      else if (length(vals) > 0) vals[1]
+      else NULL
       
       updateSelectInput(
-        session, "filter_value",
+        session,
+        "filter_value",
         choices = vals,
         selected = default_val
       )
@@ -621,9 +747,6 @@ server <- function(input, output, session) {
   })
   
   output$outlier_stats <- renderPrint({
-    df <- clean_data()
-    req(df)
-    
     outlier_df <- outlier_summary()
     
     if ("Message" %in% names(outlier_df)) {
@@ -746,4 +869,3 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui = ui, server = server)
-
