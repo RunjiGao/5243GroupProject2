@@ -4,7 +4,7 @@ A no-code interactive data science web application built with R Shiny. Upload an
 
 🔗 **Live App:** https://5243groupproject2.shinyapps.io/5243GroupProject2/ 
 
-📄 **Project Report:** See `report/DataPilot_Report.docx`
+📄 **Project Report:** See `5243Project2(1).pdf`
 
 ---
 
